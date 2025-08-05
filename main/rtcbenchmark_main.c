@@ -1,9 +1,3 @@
-/*
- * SPDX-FileCopyrightText: 2021-2022 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: CC0-1.0
- */
-
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -25,12 +19,12 @@
 
 static const char *TAG = "RTC_BENCHMARK";
 
-// Wi-Fi credentials
+// wiFi credentials
 #define WIFI_SSID      "TP-LINK_7CF2"
 #define WIFI_PASS      "gtUp5xWL"
 #define MAXIMUM_RETRY  5
 
-// Experiment parameters
+// experiment parameters
 #define SAMPLE_INTERVAL_MINUTES 10
 #define EXPERIMENT_DURATION_HOURS 10
 
@@ -64,11 +58,11 @@ static void event_handler(void* arg, esp_event_base_t event_base,
 void time_sync_notification_cb(struct timeval *tv)
 {
     ESP_LOGI(TAG, "Time synchronized");
-    // Set timezone to Central European Time
+    // set timezone to Central European Time
     setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
     tzset();
     
-    // Notify the main task that time is synchronized
+    // notify the main task that time is synchronized
     xSemaphoreGive(s_time_sync_sem);
 }
 
@@ -118,12 +112,10 @@ void wifi_init_sta(void)
 
     ESP_LOGI(TAG, "wifi_init_sta finished. Waiting for time synchronization.");
     
-    // Wait for time synchronization with a timeout
     if (xSemaphoreTake(s_time_sync_sem, pdMS_TO_TICKS(60000)) == pdTRUE) { // 1 minute timeout
         ESP_LOGI(TAG, "Initial time synchronization complete.");
     } else {
         ESP_LOGE(TAG, "Failed to synchronize time within 60 seconds. Aborting experiment.");
-        // You might want to handle this error more gracefully, e.g. by restarting
     }
 }
 
@@ -132,7 +124,7 @@ void app_main(void)
 {
     const char filename[32];
     ESP_LOGI(TAG, "------------------------------INITIALIZATION------------------------------");
-    //Initialize NVS
+    //initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
       ESP_ERROR_CHECK(nvs_flash_erase());
@@ -140,7 +132,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // This will initialize Wi-Fi and wait for the first NTP sync
+    // initialize wifi and wait for the first NTP sync
     wifi_init_sta();
 
     ESP_LOGI(TAG, "Initializing SD card...");
@@ -148,63 +140,11 @@ void app_main(void)
     int index = sd_write_index(MOUNT_POINT"/index.txt");
     sprintf(filename, MOUNT_POINT"/data%d.csv", index);
     sd_write_file_header(filename);
-/*
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = true,
-        .max_files = 5,
-        .allocation_unit_size = 16 * 1024
-    };
-
-    sdmmc_card_t *card;
-    const char mount_point[] = "/sdcard";
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = PIN_NUM_MOSI,
-        .miso_io_num = PIN_NUM_MISO,
-        .sclk_io_num = PIN_NUM_CLK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4000,
-    };
-
-    ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize SPI bus.");
-        return;
-    }
-
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = PIN_NUM_CS;
-    slot_config.host_id = host.slot;
-
-    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
-
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to mount SD card (%s).", esp_err_to_name(ret));
-        return;
-    }
-    
-    ESP_LOGI(TAG, "SD card mounted successfully.");
-    sdmmc_card_print_info(stdout, card);
-*/
     ESP_LOGI(TAG, "--------------------------------------------------------------------------");
 
     ESP_LOGI(TAG, "--------------------------------------RTC Benchmark--------------------------------------");
 
-    // Open log file
-    //
-   /*
-    const char* log_file_path = "/sdcard/drift_log.csv";
-    ESP_LOGI(TAG, "Opening log file: %s", log_file_path);
-    FILE* f = fopen(log_file_path, "w");
-    if (f == NULL) {
-        ESP_LOGE(TAG, "Failed to open file for writing");
-        return;
-    }
-    fprintf(f, "NTP Time,RTC Time,Offset (s)\n");
-    fclose(f);
-*/
-    // Record start times
+    // record start times
     struct timeval tv_start;
     gettimeofday(&tv_start, NULL);
     int64_t rtc_start_micros = esp_timer_get_time();
@@ -219,20 +159,20 @@ void app_main(void)
     for (int i = 0; i < num_samples; i++) {
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
 
-        // Get current times
+        // fetch current times
         struct timeval tv_current;
         gettimeofday(&tv_current, NULL);
         int64_t rtc_current_micros = esp_timer_get_time();
 
-        // Calculate elapsed times in seconds
+        // calculate elapsed times in seconds
         double elapsed_ntp_s = (double)(tv_current.tv_sec - tv_start.tv_sec) + 
                                (double)(tv_current.tv_usec - tv_start.tv_usec) / 1000000.0;
         double elapsed_rtc_s = (double)(rtc_current_micros - rtc_start_micros) / 1000000.0;
 
-        // Calculate offset
+        // calculate offset
         double offset_s = elapsed_rtc_s - elapsed_ntp_s;
 
-        // Calculate the current time according to the RTC
+        // calculate the current time according to the RTC
         struct timeval tv_rtc_current;
         tv_rtc_current.tv_sec = tv_start.tv_sec + (time_t)elapsed_rtc_s;
         tv_rtc_current.tv_usec = tv_start.tv_usec + (long)((elapsed_rtc_s - (long)elapsed_rtc_s) * 1000000.0);
@@ -241,7 +181,7 @@ void app_main(void)
             tv_rtc_current.tv_usec -= 1000000;
         }
 
-        // Format time strings
+        // format time strings
         char ntp_time_str[64];
         char rtc_time_str[64];
         strftime(ntp_time_str, sizeof(ntp_time_str), "%Y-%m-%d %H:%M:%S", localtime(&tv_current.tv_sec));
@@ -250,17 +190,8 @@ void app_main(void)
         ESP_LOGI(TAG, "Sample %d/%d: NTP: %s, RTC: %s, Offset: %.6f s", 
                  i + 1, num_samples, ntp_time_str, rtc_time_str, offset_s);
 
-        // Log to SD card
+        // log to SD card
         sd__write_file(filename,ntp_time_str, rtc_time_str, offset_s);
-        /*
-        f = fopen(log_file_path, "a");
-        if (f == NULL) {
-            ESP_LOGE(TAG, "Failed to open file for appending");
-            continue; // Skip this sample if file can't be opened
-        }
-        fprintf(f, "%s,%s,%.6f\n", ntp_time_str, rtc_time_str, offset_s);
-        fclose(f);
-        */
     }
 
     ESP_LOGI(TAG, "Experiment finished.");
