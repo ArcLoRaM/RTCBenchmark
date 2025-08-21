@@ -10,6 +10,7 @@
 #include "esp_event.h"
 #include "nvs_flash.h"
 #include "esp_sntp.h"
+//#include "lwip/sntp.h" // Add this include for lwIP SNTP functions
 #include "driver/spi_common.h"
 #include "driver/sdspi_host.h"
 #include "sdmmc_cmd.h"
@@ -30,6 +31,8 @@ static const char *TAG = "RTC_BENCHMARK";
 
 static int s_retry_num = 0;
 static SemaphoreHandle_t s_time_sync_sem;
+static int sntp_delay_ms = -1; // Variable to store the last SNTP round-trip delay
+static int64_t sync_start_time = 0; // Time when sync was initiated
 
 void initialize_sntp(void);
 
@@ -57,7 +60,17 @@ static void event_handler(void* arg, esp_event_base_t event_base,
 
 void time_sync_notification_cb(struct timeval *tv)
 {
+    // Calculate round-trip delay
+    if (sync_start_time != 0) {
+        int64_t sync_end_time = esp_timer_get_time();
+        sntp_delay_ms = (int)((sync_end_time - sync_start_time) / 1000); // Convert to milliseconds
+        ESP_LOGI(TAG, "SNTP round-trip delay: %d ms", sntp_delay_ms);
+    } else {
+        sntp_delay_ms = 0; // First sync, no measurement
+    }
+
     ESP_LOGI(TAG, "Time synchronized");
+
     // set timezone to Central European Time
     setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
     tzset();
@@ -166,8 +179,7 @@ void app_main(void)
         int64_t rtc_current_micros = esp_timer_get_time();
 
         // calculate elapsed times in seconds
-        double elapsed_ntp_s = (double)(tv_current.tv_sec - tv_start.tv_sec) + 
-                               (double)(tv_current.tv_usec - tv_start.tv_usec) / 1000000.0;
+        double elapsed_ntp_s = (double)(tv_current.tv_sec - tv_start.tv_sec) + (double)(tv_current.tv_usec - tv_start.tv_usec) / 1000000.0;
         double elapsed_rtc_s = (double)(rtc_current_micros - rtc_start_micros) / 1000000.0;
 
         // calculate offset
@@ -188,11 +200,11 @@ void app_main(void)
         strftime(ntp_time_str, sizeof(ntp_time_str), "%Y-%m-%d %H:%M:%S", localtime(&tv_current.tv_sec));
         strftime(rtc_time_str, sizeof(rtc_time_str), "%Y-%m-%d %H:%M:%S", localtime(&tv_rtc_current.tv_sec));
 
-        ESP_LOGI(TAG, "Sample %d/%d: NTP: %s, RTC: %s, Offset: %.6f s", 
-                 i + 1, num_samples, ntp_time_str, rtc_time_str, offset_s);
+        ESP_LOGI(TAG, "Sample %d/%d: NTP: %s, RTC: %s, Offset: %.6f s, Delay: %d ms", 
+                 i + 1, num_samples, ntp_time_str, rtc_time_str, offset_s, sntp_delay_ms);
 
         // log to SD card
-        sd__write_file(filename,ntp_time_str, rtc_time_str, offset_s);
+        sd__write_file(filename,ntp_time_str, rtc_time_str, offset_s, sntp_delay_ms);
     }
 
     ESP_LOGI(TAG, "Experiment finished.");

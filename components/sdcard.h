@@ -1,5 +1,6 @@
 #include <string.h>
 #include <sys/unistd.h>
+#include <sys/stat.h>
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include <driver/sdmmc_host.h>
@@ -52,20 +53,20 @@ static esp_err_t sd_write_file_header(const char *path){
         ESP_LOGE(SD_TAG, "Failed to open file for writing");
         return ESP_FAIL;
     }
-    fprintf(f, "NTP Time, RTC Time, Offset \n");
+    fprintf(f, "Timestamp, PPS_Time, RTC_Time, Offset_us, Offset_ms, PPS_Count, PPS_Avg_us, PPS_Jitter_us\n");
     fclose(f);
     ESP_LOGI(SD_TAG, "Headers in data.csv created.");
     return ESP_OK;
 }
 
-static esp_err_t sd__write_file(const char *path, char ntptime[64], char rtctime[64], double offset){
+static esp_err_t sd__write_file(const char *path, char ntptime[64], char rtctime[64], double offset, int delay_ms){
     ESP_LOGI(SD_TAG, "Opening file %s", path);
     FILE *f = fopen(path, "a");
     if (f == NULL) {
         ESP_LOGE(SD_TAG, "Failed to open file for writing");
         return ESP_FAIL;
     }
-    fprintf(f, "%s, %s, %.6f \n", ntptime, rtctime, offset);
+    fprintf(f, "%s, %s, %.6f, %d \n", ntptime, rtctime, offset, delay_ms);
     fclose(f);
     ESP_LOGI(SD_TAG, "File written");
 

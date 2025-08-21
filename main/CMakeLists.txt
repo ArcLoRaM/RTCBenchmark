@@ -1,2 +1,4 @@
-idf_component_register(SRCS "rtcbenchmark_main.c"
-                       INCLUDE_DIRS "")
+idf_component_register(
+    SRCS "rtcbenchmark_main_gps.c" "gps_redo.c"
+    INCLUDE_DIRS "."
+)
