@@ -1,0 +1,21 @@
+dependencies:
+  idf:
+    source:
+      type: idf
+    version: 5.5.0
+  igrr/libnmea:
+    component_hash: d6e78e853e75882c17cd4f200d110b84824e728cefbb84152227f0f4f98d8a50
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.2.1
+direct_dependencies:
+- idf
+- igrr/libnmea
+manifest_hash: 826a15c2061baa6c02d4b3431467ce835ec1c982052b69077eae2496136274de
+target: esp32
+version: 2.0.0

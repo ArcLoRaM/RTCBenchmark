@@ -34,6 +34,11 @@ static struct tm synchronized_time;
 static uint64_t sync_timestamp_us = 0;
 static FILE* log_file = NULL;
 
+// PPS-aligned synchronization control
+static volatile bool pending_sync = false;              // armed when we parsed a valid GPRMC, waiting for next PPS
+static volatile uint64_t pending_sync_target_sec = 0;   // time_t (seconds since epoch) to set at the PPS
+static volatile uint64_t pending_sync_armed_pps = 0;    // pps_count value when we armed the sync
+
 // array to store past PPS timestamps, this is later used for the jitter analysis
 #define PPS_HISTORY_SIZE 10
 static volatile uint64_t pps_timestamps[PPS_HISTORY_SIZE];
@@ -70,20 +75,14 @@ void synchronize_time_from_gprmc(const char* time_str, const char* date_str) {
         synchronized_time.tm_mon = month - 1;  // tm_mon is 0-based
         synchronized_time.tm_year = year - 1900;  // tm_year is years since 1900
         
-        // convert to time_t and set ESP32 RTC
-        time_t gps_time = mktime(&synchronized_time);
-        struct timeval tv;
-        tv.tv_sec = gps_time;
-        tv.tv_usec = 0;
-        settimeofday(&tv, NULL);
-        
-        sync_timestamp_us = esp_timer_get_time();
-        pps_count = 0;  // reset PPS counter at synchronization
-        time_synchronized = true;
-        
-        ESP_LOGI(GPS_REDO_TAG, "Time synchronized: %04d-%02d-%02d %02d:%02d:%02d UTC", 
-                 year, month, day, hours, minutes, seconds);
-        ESP_LOGI(GPS_REDO_TAG, "ESP32 RTC synchronized with GPS time");
+    // convert to time_t in UTC (TZ should be set to UTC); arm sync on the NEXT PPS edge
+    time_t gps_time = mktime(&synchronized_time);
+    pending_sync_target_sec = (uint64_t)gps_time + 1ULL; // next PPS corresponds to next whole second for most GPS modules
+    pending_sync_armed_pps = pps_count;
+    pending_sync = true;
+
+    ESP_LOGI(GPS_REDO_TAG, "GPS time parsed (UTC): %04d-%02d-%02d %02d:%02d:%02d; arming sync at next PPS to +1s",
+         year, month, day, hours, minutes, seconds);
     }
 }
 
@@ -97,13 +96,15 @@ void get_pps_time_precise(uint64_t* pps_time_us) {
     // calculate time based on PPS count and initial synchronization point
     // each PPS pulse represents exactly 1 second
     uint64_t elapsed_seconds = pps_count;
-    
-    // convert synchronized time to microseconds since epoch
+
+    // convert synchronized time (UTC) to microseconds since epoch
     time_t sync_time = mktime(&synchronized_time);
     uint64_t sync_time_us = (uint64_t)sync_time * 1000000ULL;
-    
-    // add elapsed seconds from PPS count
-    *pps_time_us = sync_time_us + (elapsed_seconds * 1000000ULL);
+
+    // add elapsed seconds and fractional time since last PPS measured by esp_timer
+    uint64_t now_us = esp_timer_get_time();
+    uint64_t frac_us = (now_us >= last_pps_time_us) ? ((now_us - last_pps_time_us) % 1000000ULL) : 0ULL;
+    *pps_time_us = sync_time_us + (elapsed_seconds * 1000000ULL) + frac_us;
 }
 
 // get ESP32 RTC time in microseconds
@@ -393,6 +394,29 @@ void gps_uart_task(void) {
                 }
             }
         }
+        // If we armed a PPS-aligned sync, complete it right after the next PPS occurs (pps_count incremented)
+        if (pending_sync && pps_count > pending_sync_armed_pps) {
+            struct timeval tv;
+            tv.tv_sec = (time_t)pending_sync_target_sec;
+            tv.tv_usec = 0;
+            settimeofday(&tv, NULL);
+
+            // Update synchronized_time to the set UTC time
+            time_t t = (time_t)pending_sync_target_sec;
+            struct tm* utc_tm = gmtime(&t);
+            if (utc_tm) {
+                synchronized_time = *utc_tm;
+            }
+
+            sync_timestamp_us = esp_timer_get_time();
+            pps_count = 0;  // reset after synchronization at PPS edge
+            time_synchronized = true;
+            pending_sync = false;
+            ESP_LOGI(GPS_REDO_TAG, "ESP32 RTC synchronized on PPS: %04d-%02d-%02d %02d:%02d:%02d UTC",
+                     synchronized_time.tm_year + 1900, synchronized_time.tm_mon + 1, synchronized_time.tm_mday,
+                     synchronized_time.tm_hour, synchronized_time.tm_min, synchronized_time.tm_sec);
+        }
+
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 

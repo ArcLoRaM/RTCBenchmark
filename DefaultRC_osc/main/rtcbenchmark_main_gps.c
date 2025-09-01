@@ -13,6 +13,7 @@
 #include "driver/mcpwm_cap.h"
  #include "sdcard.h"
  #include "math.h"
+ #include <stdlib.h>
 
 
 // experiment parameters
@@ -198,6 +199,9 @@ void analyze_hardware_captures(void) {
 void app_main(void)
 {
     ESP_LOGI(TAG, "GPS RTC Benchmark init");
+    // Force UTC for all time conversions (avoid DST/local offsets)
+    setenv("TZ", "UTC0", 1);
+    tzset();
     
     // initialize NVS
     esp_err_t ret = nvs_flash_init();

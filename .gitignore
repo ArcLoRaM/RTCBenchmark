@@ -1,0 +1,44 @@
+.DS_Store
+
+# ESP-IDF build output
+TCXO_osc/build/
+XTAL32khz_osc/build/
+DefaultRC_osc/build/
+TCXO_osc/main/build/
+XTAL32khz_osc/main/build/
+DefaultRC_osc/main/build/
+
+# component manager
+TCXO_osc/managed_components/
+XTAL32khz_osc/managed_components/
+DefaultRC_osc/managed_components/
+
+# Configuration backups
+TCXO_osc/sdkconfig.old
+XTAL32khz_osc/sdkconfig.old
+DefaultRC_osc/sdkconfig.old
+
+# cache
+TCXO_osc/.cache
+DefaultRC_osc/.cache
+XTAL32khz_osc/.cache
+
+# OS / Editor junk
+.DS_Store
+TCXO_osc/.DS_Store
+XTAL32khz_osc/.DS_Store
+DefaultRC_osc/.DS_Store
+
+Thumbs.db
+*.swp
+*.swo
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# CLion / JetBrains
+.idea/
+
+# Logs
+*.log
