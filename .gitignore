@@ -7,27 +7,39 @@ DefaultRC_osc/build/
 TCXO_osc/main/build/
 XTAL32khz_osc/main/build/
 DefaultRC_osc/main/build/
+Power_Consumption/build/
+Power_Consumption/main/build/
+XTALvTCXO_compensation/build/
+XTALvTCXO_compensation/main/build/
 
 # component manager
 TCXO_osc/managed_components/
 XTAL32khz_osc/managed_components/
 DefaultRC_osc/managed_components/
+XTALvTCXO_compensation/managed_components/
+Power_Consumption/managed_components/
 
 # Configuration backups
 TCXO_osc/sdkconfig.old
 XTAL32khz_osc/sdkconfig.old
 DefaultRC_osc/sdkconfig.old
+Power_Consumption/sdkconfig.old
+XTALvTCXO_compensation/sdkconfig.old
 
 # cache
 TCXO_osc/.cache
 DefaultRC_osc/.cache
 XTAL32khz_osc/.cache
+Power_Consumption/.cache
+XTALvTCXO_compensation/.cache
 
 # OS / Editor junk
 .DS_Store
 TCXO_osc/.DS_Store
 XTAL32khz_osc/.DS_Store
 DefaultRC_osc/.DS_Store
+XTALvTCXO_compensation/.DS_Store
+Power_Consumption/.DS_Store
 
 Thumbs.db
 *.swp
@@ -36,9 +48,6 @@ Thumbs.db
 # VS Code
 .vscode/
 *.code-workspace
-
-# CLion / JetBrains
-.idea/
 
 # Logs
 *.log
