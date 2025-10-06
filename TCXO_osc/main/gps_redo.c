@@ -1,3 +1,4 @@
+// Cleaned includes (restored)
 #include "gps_redo.h"
 #include "esp_log.h"
 #include "driver/uart.h"
@@ -10,49 +11,43 @@
 #include <time.h>
 #include <math.h>
 #include <nmea.h>
+#include "ds3231.h"
+#include <unistd.h>
+#include <sys/stat.h>
 
-// sentence parsing is manual for GPRMC.
+// access RTC slow clock time in microseconds
+extern uint64_t esp_rtc_get_time_us(void);
 
-// timezone offset in hours (denmark 2 hours ahead of UTC)
-#define TIMEZONE_OFFSET_HOURS 2
+// ------------------ constants ------------------
+static DS3231_Info* s_rtc = NULL;  // external rtc handle
+void gps_register_ds3231(DS3231_Info* rtc) { s_rtc = rtc; }
 
-// PPS signal GPIO pin
-#define PPS_GPIO_PIN 4
-// measurement interval (compare PPS and RTC every 10 minutes)
-#define COMPARISON_INTERVAL_MINUTES 10
+static volatile uint64_t rtc32k_sync_us = 0;   // esp_rtc_get_time_us() captured at sync PPS
+static volatile uint64_t epoch_sync_us  = 0;   // epoch microseconds at sync
+static volatile bool     rtc32k_inited  = false;
 
-// UART buffer size
 static const int uart_buffer_size = 1024;
-static const int GPS_UART_TIMEOUT_MS = 200;     // read timeout
-static const int GPS_LOG_EVERY_S = 60;          // throttle GPS info logs
+static const int GPS_UART_TIMEOUT_MS = 200;
+static const int GPS_LOG_EVERY_S = 60;  // periodic console GPS info
+// --------------------------------------------------------------------------
 
 // initialize global variables for time synchronization
 volatile uint64_t pps_count = 0;
-volatile uint64_t last_pps_time_us = 0;
 volatile bool time_synchronized = false;
 static struct tm synchronized_time;
 static uint64_t sync_timestamp_us = 0;
-static FILE* log_file = NULL;
-
-// PPS-aligned synchronization control
-static volatile bool pending_sync = false;              // armed when we parsed a valid GPRMC, waiting for next PPS
+static volatile bool pending_sync = false;              // armed when parsed a valid GPRMC, waiting for next PPS
 static volatile uint64_t pending_sync_target_sec = 0;   // time_t (seconds since epoch) to set at the PPS
 static volatile uint64_t pending_sync_armed_pps = 0;    // pps_count value when we armed the sync
 
-// array to store past PPS timestamps, this is later used for the jitter analysis
-#define PPS_HISTORY_SIZE 10
-static volatile uint64_t pps_timestamps[PPS_HISTORY_SIZE];
-static volatile int pps_history_index = 0;
+
+static FILE* log_file = NULL;
 
 // common function to record a PPS pulse timestamp
 void gps_record_pps_pulse(uint64_t ts_us) {
-    last_pps_time_us = ts_us;
+    (void)ts_us; 
     pps_count++;
-    // store timestamp in circular buffer for jitter analysis
-    pps_timestamps[pps_history_index] = ts_us;
-    pps_history_index = (pps_history_index + 1) % PPS_HISTORY_SIZE;
 }
-
 
 // synchronize the time fetched through GPRMC data from NMEA of the GPS module
 void synchronize_time_from_gprmc(const char* time_str, const char* date_str) {
@@ -86,212 +81,130 @@ void synchronize_time_from_gprmc(const char* time_str, const char* date_str) {
     }
 }
 
-// get current time based on PPS count and initial sync with microsecond precision
-void get_pps_time_precise(uint64_t* pps_time_us) {
-    if (!time_synchronized) {
-        *pps_time_us = 0;
-        return;
-    }
-    
-    // calculate time based on PPS count and initial synchronization point
-    // each PPS pulse represents exactly 1 second
-    uint64_t elapsed_seconds = pps_count;
-
-    // convert synchronized time (UTC) to microseconds since epoch
-    time_t sync_time = mktime(&synchronized_time);
-    uint64_t sync_time_us = (uint64_t)sync_time * 1000000ULL;
-
-    // add elapsed seconds and fractional time since last PPS measured by esp_timer
-    uint64_t now_us = esp_timer_get_time();
-    uint64_t frac_us = (now_us >= last_pps_time_us) ? ((now_us - last_pps_time_us) % 1000000ULL) : 0ULL;
-    *pps_time_us = sync_time_us + (elapsed_seconds * 1000000ULL) + frac_us;
-}
-
-// get ESP32 RTC time in microseconds
-void get_rtc_time_precise(uint64_t* rtc_time_us) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    *rtc_time_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
-}
-
 // calculate time difference in microseconds
 int64_t time_diff_us(uint64_t time1_us, uint64_t time2_us) {
-    return (int64_t)(time1_us - time2_us);
+    return (int64_t)time1_us - (int64_t)time2_us;
 }
 
-// calculate PPS jitter statistics
-void get_pps_jitter_stats(double* avg_interval_us, double* apparent_jitter_us) {
-    if (pps_count < 2) {
-        *avg_interval_us = 0.0;
-        *apparent_jitter_us = 0.0;
-        return;
-    }
-    
-    // calculate intervals between recent PPS pulses AS MEASURED BY ESP32 TIMER, so not 100% accurate but should be ~99% accurate
-    double intervals[PPS_HISTORY_SIZE - 1];
-    int valid_intervals = 0;
-    
-    for (int i = 0; i < PPS_HISTORY_SIZE - 1 && valid_intervals < (int)(pps_count - 1); i++) {
-        int curr_idx = (pps_history_index - 1 - i + PPS_HISTORY_SIZE) % PPS_HISTORY_SIZE;
-        int prev_idx = (pps_history_index - 2 - i + PPS_HISTORY_SIZE) % PPS_HISTORY_SIZE;
-        
-        if (pps_timestamps[curr_idx] > 0 && pps_timestamps[prev_idx] > 0) {
-            intervals[valid_intervals] = (double)(pps_timestamps[curr_idx] - pps_timestamps[prev_idx]);
-            valid_intervals++;
-        }
-    }
-    
-    if (valid_intervals == 0) {
-        *avg_interval_us = 0.0;
-        *apparent_jitter_us = 0.0;
-        return;
-    }
-    
-    // calculate average interval
-    double sum = 0.0;
-    for (int i = 0; i < valid_intervals; i++) {
-        sum += intervals[i];
-    }
-    *avg_interval_us = sum / valid_intervals;
-    
-    // calculate apparent jitter
-    double variance = 0.0;
-    for (int i = 0; i < valid_intervals; i++) {
-        double diff = intervals[i] - *avg_interval_us;
-        variance += diff * diff;
-    }
-    *apparent_jitter_us = sqrt(variance / valid_intervals);
-}
-
-// log comparison data to SD card and display information on console
-void log_time_comparison(const char* filename) {
-    if (!time_synchronized) {
-        ESP_LOGW(GPS_REDO_TAG, "Time not synchronized yet, skipping comparison");
-        return;
-    }
-    
-    // get high-precision timestamps
-    uint64_t pps_time_us, rtc_time_us;
-    get_pps_time_precise(&pps_time_us);
-    get_rtc_time_precise(&rtc_time_us);
-    
-    // calculate offset in microseconds
-    int64_t offset_us = time_diff_us(pps_time_us, rtc_time_us);
-    
-    // get PPS jitter
-    double avg_interval_us, apparent_jitter_us;
-    get_pps_jitter_stats(&avg_interval_us, &apparent_jitter_us);
-    
-    // convert timestamps to readable format for logging
-    time_t pps_time_sec = pps_time_us / 1000000ULL;
-    time_t rtc_time_sec = rtc_time_us / 1000000ULL;
-    uint32_t pps_time_usec = pps_time_us % 1000000ULL;
-    uint32_t rtc_time_usec = rtc_time_us % 1000000ULL;
-    
-    struct tm* pps_tm = gmtime(&pps_time_sec);
-    struct tm* rtc_tm = gmtime(&rtc_time_sec);
-    
-    // log to console
-    ESP_LOGI(GPS_REDO_TAG, "Time Comparison [μs precision]:");
-    ESP_LOGI(GPS_REDO_TAG, "  PPS: %04d-%02d-%02d %02d:%02d:%02d.%06lu UTC", 
-             pps_tm->tm_year + 1900, pps_tm->tm_mon + 1, pps_tm->tm_mday,
-             pps_tm->tm_hour, pps_tm->tm_min, pps_tm->tm_sec, pps_time_usec);
-    ESP_LOGI(GPS_REDO_TAG, "  RTC: %04d-%02d-%02d %02d:%02d:%02d.%06lu UTC", 
-             rtc_tm->tm_year + 1900, rtc_tm->tm_mon + 1, rtc_tm->tm_mday,
-             rtc_tm->tm_hour, rtc_tm->tm_min, rtc_tm->tm_sec, rtc_time_usec);
-    ESP_LOGI(GPS_REDO_TAG, "  Offset: %lld μs (%.3f ms)", offset_us, offset_us / 1000.0);
-    ESP_LOGI(GPS_REDO_TAG, "  PPS: Avg=%.1f μs, Jitter=%.1f μs", avg_interval_us, apparent_jitter_us);
-    
-    // log to SD card
-    if (log_file == NULL) {
-        log_file = fopen(filename, "a");
-        if (log_file != NULL) {
-            // write header if file is new
-            fseek(log_file, 0, SEEK_END);
-            if (ftell(log_file) == 0) {
-                fprintf(log_file, "Timestamp_us,PPS_Time_us,RTC_Time_us,Offset_us,Offset_ms,PPS_Count,ESP32_Avg_us,ESP32_Jitter_us\n");
-            }
-        }
-    }
-    
-    if (log_file != NULL) {
-        uint64_t log_timestamp_us = esp_timer_get_time();
-        fprintf(log_file, "%llu,%llu,%llu,%lld,%.3f,%llu,%.1f,%.1f\n",
-                log_timestamp_us, pps_time_us, rtc_time_us, offset_us, 
-                offset_us / 1000.0, pps_count, avg_interval_us, apparent_jitter_us);
-        fflush(log_file);
-    } else {
-        ESP_LOGE(GPS_REDO_TAG, "Failed to open log file on SD card");
-    }
-}
-
-// convert UTC time to local time string
-void convert_utc_to_local(int utc_hours, int utc_minutes, int utc_seconds, 
-                         char* local_time_str, size_t str_size) {
-    int local_hours = utc_hours + TIMEZONE_OFFSET_HOURS;
-    
-    // handle day rollover
-    if (local_hours >= 24) {
-        local_hours -= 24;
-    } else if (local_hours < 0) {
-        local_hours += 24;
-    }
-    
-    snprintf(local_time_str, str_size, "%02d:%02d:%02d Local", 
-             local_hours, utc_minutes, utc_seconds);
-}
-
-// simple GPRMC extraction (time/date/status)
+// ------------------ GPRMC parsing helper -----------------------
 static bool parse_gprmc_sentence(const char* sentence,
                                  char raw_time[7],
                                  char raw_date[7],
                                  char* status,
-                                 char local_time_str[32],
+                                 char time_str[32],
                                  char date_str[32]) {
-    // tokenize without modifying original
+    if (!sentence || !raw_time || !raw_date || !status || !time_str || !date_str) return false;
     char tmp[256];
-    strncpy(tmp, sentence, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
-
-    char* tokens[13] = {0};
-    int token_count = 0;
-    char* tok = strtok(tmp, ",");
-    while (tok && token_count < 13) {
-        tokens[token_count++] = tok;
-        tok = strtok(NULL, ",");
-    }
-
-    if (token_count < 9) return false;
-
+    strncpy(tmp, sentence, sizeof(tmp)-1); tmp[sizeof(tmp)-1] = '\0';
+    char* tokens[16] = {0};
+    int count = 0; char* tok = strtok(tmp, ",");
+    while (tok && count < 16) { tokens[count++] = tok; tok = strtok(NULL, ","); }
+    if (count < 9) return false;
     // time
     raw_time[0] = '\0';
     if (tokens[1] && strlen(tokens[1]) >= 6) {
-        strncpy(raw_time, tokens[1], 6);
-        raw_time[6] = '\0';
+        strncpy(raw_time, tokens[1], 6); raw_time[6] = '\0';
         int h = (tokens[1][0]-'0')*10 + (tokens[1][1]-'0');
         int m = (tokens[1][2]-'0')*10 + (tokens[1][3]-'0');
         int s = (tokens[1][4]-'0')*10 + (tokens[1][5]-'0');
-        convert_utc_to_local(h, m, s, local_time_str, 32);
-    } else {
-        local_time_str[0] = '\0';
-    }
-
-    // status
+        snprintf(time_str, 32, "%02d:%02d:%02d", h,m,s);
+    } else time_str[0] = '\0';
     *status = (tokens[2] && tokens[2][0]) ? tokens[2][0] : 'V';
-
-    // date
     raw_date[0] = '\0';
     if (tokens[8] && strlen(tokens[8]) >= 6) {
-        strncpy(raw_date, tokens[8], 6);
-        raw_date[6] = '\0';
+        strncpy(raw_date, tokens[8], 6); raw_date[6] = '\0';
         char day[3] = {tokens[8][0], tokens[8][1], '\0'};
         char mon[3] = {tokens[8][2], tokens[8][3], '\0'};
         char yr[3]  = {tokens[8][4], tokens[8][5], '\0'};
         snprintf(date_str, 32, "%s/%s/20%s", day, mon, yr);
-    } else {
-        date_str[0] = '\0';
-    }
+    } else date_str[0] = '\0';
     return true;
+}
+// --------------------------------------------------------------------------
+
+void log_time_comparison_at_pps(const char* filename) {
+    if (!time_synchronized) return;
+    extern uint64_t get_last_rtc32k_at_pps(void);
+    extern uint64_t get_last_pps_count_captured(void);
+    extern int64_t  get_last_pps_sqw_phase_us(void);
+    extern uint64_t get_last_sqw_edge_time_us(void);
+
+    uint64_t rtc32k_at_pps = get_last_rtc32k_at_pps();
+    uint64_t pps_k         = get_last_pps_count_captured();
+    int64_t  phase_us      = get_last_pps_sqw_phase_us();
+    bool ds_valid          = (get_last_sqw_edge_time_us() != 0ULL);
+
+    uint64_t elapsed_real_us = pps_k * 1000000ULL;
+    uint64_t elapsed_rtc_us  = rtc32k_at_pps - rtc32k_sync_us;
+    uint64_t pps_time_us     = epoch_sync_us + elapsed_real_us;
+
+    uint64_t ds_time_us = 0ULL;
+    if (ds_valid) {
+        uint64_t ds_frac_at_pps = (phase_us >= 0) ? (uint64_t)phase_us : (uint64_t)(1000000LL + phase_us);
+        if (ds_frac_at_pps >= 1000000ULL) ds_frac_at_pps %= 1000000ULL;
+        ds_time_us = (pps_time_us/1000000ULL)*1000000ULL + ds_frac_at_pps;
+    }
+
+    int64_t xtal_offset_us = (int64_t)elapsed_real_us - (int64_t)elapsed_rtc_us;
+    int64_t ds_offset_us   = ds_valid ? ((int64_t)pps_time_us - (int64_t)ds_time_us) : 0;
+
+    if (!log_file) {
+        log_file = fopen(filename, "a");
+        if (log_file) {
+            fseek(log_file, 0, SEEK_END);
+            if (ftell(log_file) == 0) {
+                fprintf(log_file, "PPS_Count,XTAL_Offset_us,DS_Offset_us,XTAL_Drift_us,DS_Drift_us,XTAL_PPM,DS_PPM,Temp_C\n");
+                fflush(log_file); int fd_h = fileno(log_file); if (fd_h >= 0) fsync(fd_h);
+                ESP_LOGI(GPS_REDO_TAG, "SD_LOG header written to %s", filename);
+            }
+        } else {
+            ESP_LOGE(GPS_REDO_TAG, "Cannot open %s", filename); return;
+        }
+    }
+
+    static bool     s_have_prev_logged = false;
+    static uint64_t s_prev_pps_k = 0;
+    static int64_t  s_prev_xtal_offset = 0;
+    static int64_t  s_prev_ds_offset   = 0;
+
+    uint64_t delta_pps = s_have_prev_logged ? (pps_k - s_prev_pps_k) : 0;
+    int64_t xtal_drift = 0;
+    int64_t ds_drift   = 0;
+    double xtal_ppm = 0.0;
+    double ds_ppm   = 0.0;
+    if (s_have_prev_logged && delta_pps > 0) {
+        xtal_drift = xtal_offset_us - s_prev_xtal_offset;
+        xtal_ppm   = (double)xtal_drift / (double)delta_pps;
+        if (ds_valid) {
+            ds_drift = ds_offset_us - s_prev_ds_offset;
+            ds_ppm   = (double)ds_drift / (double)delta_pps;
+        }
+    }
+
+    char temp_field[16] = "";
+    if (s_rtc) {
+        float temp_c = 0.0f;
+        if (ds3231_get_temperature(s_rtc, &temp_c) == ESP_OK) {
+            snprintf(temp_field, sizeof(temp_field), "%.2f", temp_c);
+        }
+    }
+
+    if (!s_have_prev_logged) {
+        if (ds_valid) fprintf(log_file, "%llu,%lld,%lld,,,,,,%s\n", (unsigned long long)pps_k, (long long)xtal_offset_us, (long long)ds_offset_us, temp_field);
+        else          fprintf(log_file, "%llu,%lld,,,,,,%s\n", (unsigned long long)pps_k, (long long)xtal_offset_us, temp_field);
+    } else {
+        if (ds_valid) fprintf(log_file, "%llu,%lld,%lld,%lld,%lld,%.3f,%.3f,%s\n", (unsigned long long)pps_k, (long long)xtal_offset_us, (long long)ds_offset_us, (long long)xtal_drift, (long long)ds_drift, xtal_ppm, ds_ppm, temp_field);
+        else          fprintf(log_file, "%llu,%lld,,%lld,,%.3f,,%s\n", (unsigned long long)pps_k, (long long)xtal_offset_us, (long long)xtal_drift, xtal_ppm, temp_field);
+    }
+    fflush(log_file); int fd = fileno(log_file); if (fd >= 0) fsync(fd);
+    ESP_LOGI(GPS_REDO_TAG, "SD_LOG: PPS=%llu XTAL_off=%lld DS_off=%lld driftX=%lld driftD=%lld ppmX=%.3f ppmD=%.3f", (unsigned long long)pps_k, (long long)xtal_offset_us, (long long)(ds_valid?ds_offset_us:0), (long long)xtal_drift, (long long)ds_drift, xtal_ppm, ds_ppm);
+
+    // update prev
+    s_prev_pps_k = pps_k;
+    s_prev_xtal_offset = xtal_offset_us;
+    if (ds_valid) s_prev_ds_offset = ds_offset_us;
+    s_have_prev_logged = true;
+    fclose(log_file); log_file = NULL;
 }
 
 // checksum guard
@@ -325,8 +238,6 @@ void gps_initialize(void){
     // set UART pins(TX: IO4, RX: IO5, RTS: IO18, CTS: IO19)
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_2, 17, 16, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     
-    // zero-initialize jitter buffer for initial measurements
-    for (int i = 0; i < PPS_HISTORY_SIZE; ++i) pps_timestamps[i] = 0;
     
     ESP_LOGI(GPS_REDO_TAG, "GPS and PPS initialization complete");
 }
@@ -394,21 +305,46 @@ void gps_uart_task(void) {
                 }
             }
         }
-        // If we armed a PPS-aligned sync, complete it right after the next PPS occurs (pps_count incremented)
-        if (pending_sync && pps_count > pending_sync_armed_pps) {
+    // if we armed a PPS-aligned sync, complete it right after the next PPS occurs (pps_count incremented)
+    if (pending_sync && pps_count > pending_sync_armed_pps) {
             struct timeval tv;
             tv.tv_sec = (time_t)pending_sync_target_sec;
             tv.tv_usec = 0;
             settimeofday(&tv, NULL);
 
-            // Update synchronized_time to the set UTC time
+            // update synchronized_time to the set UTC time
             time_t t = (time_t)pending_sync_target_sec;
             struct tm* utc_tm = gmtime(&t);
             if (utc_tm) {
                 synchronized_time = *utc_tm;
             }
 
+            // if external RTC is registered, set it to the same UTC at this PPS edge
+            if (s_rtc) {
+                struct tm set_tm = synchronized_time; // UTC
+                esp_err_t sr = ds3231_set_time(s_rtc, &set_tm);
+                if (sr == ESP_OK) {
+                    // clear OSF so future boots know time is valid
+                    esp_err_t cr = ds3231_clear_oscillator_stop_flag(s_rtc);
+                    bool osf_after = true;
+                    esp_err_t gr = ds3231_get_oscillator_stop_flag(s_rtc, &osf_after);
+                    if (cr == ESP_OK && gr == ESP_OK && !osf_after) {
+                        ESP_LOGI(GPS_REDO_TAG, "DS3231 set at PPS to %04d-%02d-%02d %02d:%02d:%02d UTC (OSF cleared)",
+                                 set_tm.tm_year + 1900, set_tm.tm_mon + 1, set_tm.tm_mday,
+                                 set_tm.tm_hour, set_tm.tm_min, set_tm.tm_sec);
+                    } else {
+                        ESP_LOGW(GPS_REDO_TAG, "DS3231 set at PPS ok, but OSF not confirmed clear (cr=%d, gr=%d, osf=%d)", (int)cr, (int)gr, (int)osf_after);
+                    }
+                } else {
+                    ESP_LOGW(GPS_REDO_TAG, "Failed to set DS3231 time at PPS sync (err=%d)", (int)sr);
+                }
+            }
+
             sync_timestamp_us = esp_timer_get_time();
+            // anchor XTAL 32 kHz slow-clock time to UTC at this PPS boundary
+            epoch_sync_us = (uint64_t)pending_sync_target_sec * 1000000ULL;
+            rtc32k_sync_us = esp_rtc_get_time_us();
+            rtc32k_inited = true;
             pps_count = 0;  // reset after synchronization at PPS edge
             time_synchronized = true;
             pending_sync = false;
@@ -424,33 +360,11 @@ void gps_uart_task(void) {
     vTaskDelete(NULL);
 }
 
-// task for periodic RTC comparison
-void rtc_comparison_task(const char* filename) {
-    ESP_LOGI(GPS_REDO_TAG, "RTC comparison task started");
-    
-    while (1) {
-        // wait for 10 minutes
-        vTaskDelay(pdMS_TO_TICKS(COMPARISON_INTERVAL_MINUTES * 60 * 1000));
-        
-        // perform time comparison and log
-        log_time_comparison(filename);
-    }
-}
 
 // function to start both GPS and comparison tasks
 void start_gps_benchmark_tasks(const char* filename) {
     // start GPS UART task
     xTaskCreate((TaskFunction_t)gps_uart_task, "gps_uart_task", 4096, NULL, 5, NULL);
-    
-    // start RTC comparison task
-    // create a copy of filename to pass to the task since the original might go out of scope
-    char* filename_copy = malloc(strlen(filename) + 1);
-    if (filename_copy != NULL) {
-        strcpy(filename_copy, filename);
-        xTaskCreate((TaskFunction_t)rtc_comparison_task, "rtc_comparison_task", 4096, filename_copy, 3, NULL);
-    } else {
-        ESP_LOGE(GPS_REDO_TAG, "Failed to allocate memory for filename copy");
-    }
     
     ESP_LOGI(GPS_REDO_TAG, "GPS benchmark tasks started");
 }
